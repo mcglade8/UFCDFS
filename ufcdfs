@@ -1,15 +1,74 @@
+---
+title: "UFC Projections"
+output: html_document
+date: '2022-10-25'
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+
+library(future)
+# plan(multiprocess) 
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(coach)
+library(TTR)
+library(XML)
+library(RCurl)
+# library(rlist)
+library(lpSolve)
+library(googlesheets4)
+library(R.utils)
+
+
+# Error: The size of the connection buffer (131072) was not large enough
+# to fit a complete line:
+# * Increase it by setting `Sys.setenv("VROOM_CONNECTION_SIZE")`
+# 
+# Ran this when getting error: Sys.setenv(VROOM_CONNECTION_SIZE=500072)
+```
+
+
+
 
 ### UFC ###
 ```{r UFC}
 
-num_lineups <- 20
-use_coach <- FALSE
+num_lineups <- 4
+hitvalcutoff <- .05
+max_salary <- 49700
+num_low_owned <- 3 
+num_chalk <- 3
+chalk_own_floor <- 30
+low_owned_ceiling <- 30
+cancelled <- NULL#c("Karine Silva", "Priscila Cachoeira")
+lock <- NULL#c("Jim Miller", "Jamie Mullarkey")
+bans <- NULL#c("Ji Yeon Kim", "Mandy Bohm")
 
-UFCProjections <- read.csv("C:/Users/jorda/Downloads/UFC DFS Projections.csv")
-data <- read_dk("C:/Users/jorda/Downloads/DKSalariesUFC.csv")
-bans <- c("Julian Marquez", "Deron Winn")
 
-fights <- select(UFCProjections, fight) %>%
+import <- T
+saved_import <- F
+
+if(import){
+oUFCProjections <- read_sheet("https://docs.google.com/spreadsheets/d/1YYHMKDbyvEYqy2QWmD-gTcKK2LTmriy7OPMVXU5UwMI/edit#gid=946544718")%>%
+    filter(!`Median Projection` == "Cancelled", !is.null(`Median Projection`), !is.na(Salary), !Name %in% cancelled)
+
+oUFCProjections <-oUFCProjections %>%
+    mutate(`Median Projection` = unlist(`Median Projection`))
+}
+if(saved_import){
+  save_names <- c("Name", "Salary", "GPP Need", "% win", "% ko", "% r1 w", "win pts", "ko pts", "r1 pts", "5 rounds", "win proj", "win SD", "hit val w/ win", "hit val %","fight", "ID", "Median Projection", "Chance to hit GPP Need")
+  oUFCProjections <- analysis %>%
+    select(-Name, -`Roster Position`, -`Pct Drafted`, -FPTS, -`count top 10`, -team) %>%
+    filter(!`Median Projection` == "Cancelled") %>%
+    mutate(`Median Projection` = as.numeric(`Median Projection`))
+  
+  colnames(oUFCProjections) <- save_names
+}
+#data <- read_dk("C:/Users/jorda/Downloads/DKSalariesUFC.csv")
+
+fights <- select(oUFCProjections, fight) %>%
   distinct()
 
 fights$team <- 0
@@ -18,125 +77,155 @@ for(i in 1:length(fights$fight)){
   fights$team[i] = i
 }
 
+oUFCProjections[is.na(oUFCProjections)] <- 0
+oUFCProjections <-merge(oUFCProjections, fights)
+oUFCProjections <- filter(oUFCProjections, !is.na(Name))
+oUFCProjections$ownership_proj <- predict(lm_own, oUFCProjections)
 
-UFCProjections <- select(UFCProjections, Name, Salary, ID, X..win, win.proj, win.SD, fight) %>%
-  merge(fights)
-
-UFCProjections$X..win <- as.numeric(gsub("[//%,]", "",UFCProjections$X..win))
-UFCProjections$win.proj <- as.numeric(gsub("[//%,]", "",UFCProjections$win.proj))
-UFCProjections$fpts_proj <- UFCProjections$win.proj * UFCProjections$X..win/100
-
-UFCProjections <- rename(UFCProjections, player = Name, SD = win.SD)
-
-UFCProjections <- select(UFCProjections, player, fpts_proj, SD, team)
-data <- select(data, -fpts_proj, -team)
-
-data <- merge(data, UFCProjections)
-data$team <- as.character(data$team)
-data$position <- "F"
-
-data <- data[!is.na(data$team),]
-data <- filter(data, !is.na(fpts_proj), !player %in% bans)
-
-data <- data[order(data$row_id),]
-for(i in 1:length(data$row_id)){
-  data$row_id[i] <- i
-}
-
-model <- model_generic(data, total_salary = 50000, roster_size = 6, max_from_team = 1)
-
-n <- nrow(data)
-randomness <- function(x) rnorm(n, mean = data$fpts_proj, sd = data$SD)
-
-if(use_coach){
-results <- optimize_generic(data, model, L = num_lineups, randomness = randomness)
-
-write_lineups(results, "C:/Users/jorda/Downloads/DKlineupsUFC.csv", site = "draftkings", sport = "pga")
-}else{
-
-  for(t in 1:num_lineups){
+t <- 0
+while(t < num_lineups){
+    
+    UFCProjections <- oUFCProjections %>%
+      filter(!Name %in% bans)
+    
 ### my optimizer
 
 ## Objective
 
-objective.in <- rnorm(length(data$fpts_proj), data$fpts_proj, data$SD)
+objective.in <- rnorm(length(UFCProjections$`Median Projection`), UFCProjections$`Median Projection`, sd=UFCProjections$`win SD`)
 
 ## Constraint matrix - salary, then count of fight #, then row of 1s
 
-num_fights <- max(as.numeric(data$row_id))
+num_fights <- max(as.numeric(UFCProjections$team))
 
-matrix_vector <- data$salary
-m <- length(matrix_vector)
+
+vsalary <- UFCProjections$Salary
+vhitval <- as.numeric(UFCProjections$`hit val %` > hitvalcutoff | UFCProjections$Name %in% lock)
+vthisfight <- c()
+vallfighters <- as.numeric(!is.na(UFCProjections$Name))
+vlow_owned <- as.numeric(UFCProjections$ownership_proj < low_owned_ceiling)
+vchalk <- as.numeric(UFCProjections$ownership_proj > chalk_own_floor)
+vlock <- as.numeric(UFCProjections$Name %in% lock)
+
 
 for(i in 1:num_fights){
-  n <- length(matrix_vector)
-  for(j in 1:m){
-    if(as.numeric(data$team[j])==i){
-      matrix_vector[n+j] = 1
-    } else{
-      matrix_vector[n+j] = 0
-    }
-  }
-}
-n <- length(matrix_vector)
-
-for(i in 1:m){
-  matrix_vector[n+i] = 1
+  vf <- as.numeric(UFCProjections$team == i)
+  vthisfight <- c(vthisfight, vf)
 }
 
-const.mat = matrix(matrix_vector, nrow = num_fights + 2, byrow = TRUE)
+matrix_vector <- c(vsalary, vhitval, vallfighters, vlow_owned, vchalk, vlock, vthisfight)
+
+const.mat = matrix(matrix_vector, nrow = length(matrix_vector)/length(UFCProjections$Salary), byrow = TRUE)
 
 ## Define constraints and direction - 50000 salary, 1 for each fight
-const.rhs = c(50000)
-const.dir = c("<=")
+const.rhs = c(max_salary, 6, 6, num_low_owned, num_chalk, length(lock))
+const.dir = c("<=", ">=", "==", ">=", ">=", "==")
 
 for(i in 1:num_fights){
-  const.rhs[i+1] = 1
-  const.dir[i+1] = "<="
+  const.rhs[length(const.rhs)+1] = 1
+  const.dir[length(const.dir)+1] = "<="
 }
 
-const.rhs[num_fights+2] = 6
-const.dir[num_fights+2] = "=="
 
 
 ### Optimize
 
 optimum = lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
 
-data$optimal <- optimum$solution
+UFCProjections$optimal <- optimum$solution
 
-lineup <- filter(data, optimal == 1) %>%
-  select(player)
+lineup <- filter(UFCProjections, optimal == 1)$Name
 
-if(t > 1){
-  lineups <- cbind(lineups, lineup)
+if(t > 0){
+  lineups <- rbind(lineups, lineup)
+  lineups <- unique(lineups)
+  t <- nrow(lineups)
 } else{
   lineups <- lineup
+  t <- 1
 }
-  }
+}
   
-lineups <- t(lineups)
 export_to_dk <- lineups
 
 for(k in 1:length(export_to_dk)){
-rep <- match(lineups[k], data$player)
-rep <- data$player_id[rep]
+rep <- match(lineups[k], UFCProjections$Name)
+rep <- UFCProjections$ID[rep]
 export_to_dk[k] <- rep
 }
 
 colnames(export_to_dk) <- c("F","F","F","F","F","F")
 
-}
 
-ownership <- data %>%
-  select(player)
+
+ownership <- UFCProjections %>%
+  select(Name)
 ownership$ownership_pct <- 0
 
-for(i in 1:length(ownership$player)){
-  ownership$ownership_pct[i] = sum(lineups == ownership$player[i])
+for(i in 1:length(ownership$Name)){
+  ownership$ownership_pct[i] = sum(lineups == ownership$Name[i])
 }
 ownership$ownership_pct <- ownership$ownership_pct/ length(lineups[,1])*100
 
 write.csv(export_to_dk, "C:/Users/jorda/Downloads/DKlineupsUFC.csv", row.names = FALSE)
+
+```
+
+
+### Lineup Editor
+```{r lineup-editor}
+### Build lineups above, then use this to edit entries for direct upload
+plineups <- read.csv("C:/Users/jorda/Downloads/DKEntriesUFC.csv")
+plineups <- filter(plineups, !is.na(Entry.ID) & !is.na(as.numeric(Entry.ID))) %>%
+  select(Entry.ID, Contest.Name, Contest.ID, Entry.Fee)
+newlineups <- read.csv("C:/Users/jorda/Downloads/DKLineupsUFC.csv")
+newlineups <- cbind(plineups, newlineups)
+colnames(newlineups) <- c("Entry ID", "Contest Name", "Contest ID", "Entry Fee", "F","F","F","F","F","F")
+write.csv(newlineups, "C:/Users/jorda/Downloads/DKEntriesUFC.csv", row.names = FALSE)
+```
+
+
+### Analysis
+```{r ufc-analysis}
+
+analysis <- read.csv("C:/Users/jorda/Downloads/UFC DFS - Analysis.csv")
+
+colnames(analysis) <- c("SB Name", "Name", "Roster Position", "Pct Drafted", "FPTS", "Salary","count top 10", "GPP Need", "% win", "% ko", "% r1 w", "win pts", "ko pts", "r1 pts", "5 rounds", "win proj", "win SD", "hit val w/ win", "hit val %","fight", "ID", "Median Projection", "Chance to hit GPP Need", "team")
+
+analysis <- filter(analysis, !is.na(FPTS), !`SB Name` %in% bans)
+analysis$`Pct Drafted` <- gsub("%$", "", analysis$`Pct Drafted`)
+
+analysis[, 4:19] <- sapply(analysis[, 4:19], as.numeric)
+analysis[, 21:23] <- sapply(analysis[, 21:23], as.numeric)
+
+lm_ufc <- lm(FPTS ~ Salary+ `% win` + `% ko` + `% r1 w` + `win proj` + `hit val w/ win` + `hit val %` + `Median Projection`, data = analysis)
+summary(lm_ufc)
+
+lm_own <- lm(`Pct Drafted` ~ Salary+ `% win` + `% ko` + `% r1 w` + `win proj` + `hit val w/ win` + `hit val %` + `Median Projection`, data = analysis)
+summary(lm_own)
+
+#Salary+GPP.Need+ X..win + X..ko + X..r1.w+ X5.rounds + win.proj + hit.val.w..win + hit.val.. + Median.Projection + Chance.to.hit.GPP.Need
+
+```
+
+### Write last night's projections
+```{r write-proj}
+
+
+write.csv(oUFCProjections, "C:/Users/jorda/Downloads/DKAnalysis.csv", row.names = FALSE)
+
+
+```
+
+
+### Project ownership
+```{r ownership}
+
+own_pred <- predict(lm_own, oUFCProjections)
+
+own_pred <- as.data.frame(cbind(oUFCProjections$Name, own_pred))
+
+own_pred[,2] <- sapply(own_pred[,2], as.numeric)
+
 
 ```
